@@ -160,12 +160,13 @@ class TestJustfileWiring(unittest.TestCase):
     """Verify the new recipes/variables are correctly wired into the justfile."""
 
     def test_justfile_syntax(self):
+        import shutil
+        if not shutil.which("just"):
+            self.skipTest("`just` binary not available in this environment")
         result = subprocess.run(
             ["just", "--justfile", str(JUSTFILE), "--list"],
             capture_output=True, text=True,
         )
-        if result.returncode != 0 and "No such file or directory" in (result.stderr or ""):
-            self.skipTest("`just` binary not available in this environment")
         self.assertEqual(
             result.returncode, 0,
             f"justfile failed to parse:\n{result.stderr}",

@@ -34,7 +34,7 @@ SSH="sshpass -p root ssh $SSH_OPTS root@127.0.0.1 -p ${SSH_PORT}"
 
 echo "Waiting for installed system SSH on port ${SSH_PORT}..."
 READY=0
-for i in $(seq 1 60); do
+for _ in $(seq 1 60); do
     if $SSH true 2>/dev/null; then
         READY=1
         break
