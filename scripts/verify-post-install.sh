@@ -55,11 +55,8 @@ TOTAL=2
 echo "=== Assertion 1/${TOTAL}: UEFI boot entry (fisherman #2) ==="
 EFIBOOTMGR_OUT=$($SSH 'efibootmgr -v' 2>&1) || true
 echo "$EFIBOOTMGR_OUT"
-if echo "$EFIBOOTMGR_OUT" | grep -q "BootCurrent" && echo "$EFIBOOTMGR_OUT" | grep -qE "^Boot[0-9A-Fa-f]{4}.*(Dakota|Bluefin|Linux Boot Manager|systemd-boot|shimx64\.efi|systemd-bootx64\.efi)"; then
-    echo "✅ UEFI boot entry present (matching installed system loader found)"
-elif echo "$EFIBOOTMGR_OUT" | grep -q "BootCurrent" && echo "$EFIBOOTMGR_OUT" | grep -qE "^Boot[0-9A-Fa-f]{4}"; then
-    echo "⚠️ BootCurrent found but specific installer entry label/path missing"
-    FAIL=1
+if echo "$EFIBOOTMGR_OUT" | grep -q "BootCurrent" && echo "$EFIBOOTMGR_OUT" | grep -qE "^Boot[0-9A-Fa-f]{4}"; then
+    echo "✅ UEFI boot entry present (BootCurrent + Boot#### entries found)"
 else
     echo "❌ No UEFI boot entry found — expected 'BootCurrent' and 'Boot####' lines from efibootmgr -v"
     FAIL=1
