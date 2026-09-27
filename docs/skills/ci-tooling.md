@@ -10,8 +10,8 @@ tags:
   - github-actions
   - r2
 description: Workflow definitions, runner environment, caching, and release automation for dakota-iso.
-version: "1.4"
-last_updated: "2026-08-01"
+version: "1.5"
+last_updated: "2026-09-22"
 metadata:
   type: reference
 ---
@@ -287,3 +287,43 @@ curl -sIL https://projectbluefin.dev/dakota-live-latest.iso | grep -i content-le
 Note the same protected-branch rule is why every PR needs `gh pr merge --admin`: the
 required contexts `LUKS E2E (dev)` / `LUKS E2E (stable)` no longer match any job name
 since the E2E matrix gained a variant dimension, so they never report.
+
+---
+
+## Live ISO build requirements for minimal/non-standard bases (2026-09-23)
+
+When building live ISOs on minimal Fedora/CentOS/Hummingbird bases (e.g. Utah):
+
+1. **`dbus-daemon` required for Flatpak pre-installation:**
+   `live/src/install-flatpaks.sh` starts `dbus-daemon --system --fork`. Modern Fedora/Hummingbird
+   defaults to `dbus-broker` instead of `dbus-daemon`. `dbus-daemon` must be installed via DNF
+   in `live/Containerfile` during the live environment setup stage.
+
+2. **Build cache synchronization without `rsync`:**
+   Minimal base images may not ship `rsync` in their standard repositories. `install-flatpaks.sh`
+   uses `cp -a` fallbacks when `rsync` is absent to ensure flatpak cache seeding and updating
+   does not abort the build.
+
+3. **`systemd` presets override build-time enablement:**
+   On distributions where `systemctl preset-all` runs on early boot, units without an explicit
+   preset in `/etc/systemd/system-preset/` may be disabled or masked. Services critical for CI
+   boot signaling (like `live-ready.service`) must be registered in a preset file
+   (`/etc/systemd/system-preset/90-live.preset`).  This file ships in every build; the
+   DEBUG-only `90-live-debug.preset` is deliberately not used for it.
+
+---
+
+## E2E on push to main: cancel superseded runs, skip doc-only pushes (2026-09-22)
+
+**What happened:** When multiple PRs merged in rapid succession (e.g. 7+ merges within 7 minutes), each merge triggered both `test-luks-install.yml` and `test-plain-install.yml`. Because each run takes 45–104 minutes and runs without concurrency cancellation on push, runners were spammed with dozens of redundant, superseded builder legs. Furthermore, documentation-only merges started full E2E builders unnecessarily.
+
+**The fix:**
+1. Added workflow-level concurrency to both E2E workflows with event-scoped keys and push-only cancellation:
+   ```yaml
+   concurrency:
+     group: e2e-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+     cancel-in-progress: ${{ github.event_name == 'push' }}
+   ```
+   Scoping by `github.event_name` ensures that post-merge pushes cancel superseded push runs without cancelling active `workflow_dispatch` or scheduled runs.
+2. Added `paths-ignore: ['docs/**', '**/*.md']` to the `push:` trigger to eliminate builder spam on doc-only merges.
+3. Regression tested via `test_e2e_workflows_define_push_concurrency` in `tests/test_live_build_invariants.py`.

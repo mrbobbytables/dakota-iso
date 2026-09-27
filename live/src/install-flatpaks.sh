@@ -21,13 +21,36 @@ FLATPAK_CACHE="/var/cache/flatpak-dl"
 mkdir -p "${FLATPAK_CACHE}/tmp"
 export TMPDIR="${FLATPAK_CACHE}/tmp"
 mkdir -p /run/dbus
+# An OCI flatpak remote (tuna-os, for Utah's Ghostty) makes flatpak spawn a
+# session bus of its own, and a bus refuses to start without a machine id --
+# which a container build does not have:
+#   Cannot spawn a message bus without a machine-id
+# Flathub's ostree remotes never ask for either. The id is build-time only;
+# systemd regenerates a real one on first boot. Same fix as
+# projectbluefin/utah iso/live/src/install-flatpaks.sh.
+CREATED_MACHINE_ID=0
+if [[ ! -s /etc/machine-id ]]; then
+    CREATED_MACHINE_ID=1
+    systemd-machine-id-setup >/dev/null 2>&1 || dbus-uuidgen > /etc/machine-id
+fi
 dbus-daemon --system --fork --nopidfile
+if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+    DBUS_SESSION_BUS_ADDRESS="$(dbus-daemon --session --fork --print-address)"
+    export DBUS_SESSION_BUS_ADDRESS
+fi
 sleep 1
 
 # ── Seed flatpak repo from build cache (warm start) ──────────────────────────
 if [ -d "${FLATPAK_CACHE}/repo/refs" ]; then
     echo "Seeding flatpak repo from build cache..."
-    rsync -a --ignore-existing "${FLATPAK_CACHE}/repo/" /var/lib/flatpak/repo/ || true
+    # cp, unlike rsync, will not create the destination directory, and
+    # /var/lib/flatpak/repo does not exist until flatpak first runs.
+    mkdir -p /var/lib/flatpak/repo
+    if command -v rsync >/dev/null 2>&1; then
+        rsync -a --ignore-existing "${FLATPAK_CACHE}/repo/" /var/lib/flatpak/repo/ || true
+    else
+        cp -a -n "${FLATPAK_CACHE}/repo/." /var/lib/flatpak/repo/ || true
+    fi
     echo "Cache seed complete"
 fi
 
@@ -123,13 +146,34 @@ VARIANT=$(echo "${TARGET:-dakota-nvidia}" | sed 's/-nvidia-open$//;s/-nvidia$//'
 if [ -f "/src/${VARIANT}/flatpaks" ]; then
     FLATPAKS_LIST="/src/${VARIANT}/flatpaks"
 fi
-readarray -t WANTED < <(grep -v '^[[:space:]]*#' "${FLATPAKS_LIST}" | grep -v '^[[:space:]]*$')
+readarray -t ENTRIES < <(grep -v '^[[:space:]]*#' "${FLATPAKS_LIST}" | grep -v '^[[:space:]]*$')
+
+# An entry is an app ID from Flathub, or "remote:app-id" for an app a variant
+# takes from another remote. Utah's terminal is Ghostty from the TunaOS OCI
+# remote -- Hummingbird packages no ptyxis or vte -- and without this form the
+# Utah ISO shipped no terminal at all.
+declare -A REMOTE_URLS=(
+    [tuna-os]="https://tunaos.org/flatpak/tuna-os.flatpakrepo"
+)
+declare -A BY_REMOTE=()
+WANTED=()
+for entry in "${ENTRIES[@]}"; do
+    remote=flathub app="${entry}"
+    if [[ "${entry}" == *:* ]]; then
+        remote="${entry%%:*}" app="${entry#*:}"
+        [[ -n "${REMOTE_URLS[${remote}]:-}" ]] || { echo "Unknown flatpak remote '${remote}' in ${FLATPAKS_LIST}" >&2; exit 1; }
+    fi
+    BY_REMOTE[${remote}]+="${app} "
+    WANTED+=("${app}")
+done
 
 # Install or update everything in the list (--or-update = skip if current)
 # --no-related skips locale packs and debug symbols (~3 GB uncompressed)
-if [ "${#WANTED[@]}" -gt 0 ]; then
-    flatpak install --system --noninteractive --no-related --or-update flathub "${WANTED[@]}"
-fi
+for remote in "${!BY_REMOTE[@]}"; do
+    [[ "${remote}" == flathub ]] || flatpak remote-add --system --if-not-exists "${remote}" "${REMOTE_URLS[${remote}]}"
+    read -ra apps <<< "${BY_REMOTE[${remote}]}"
+    flatpak install --system --noninteractive --no-related --or-update "${remote}" "${apps[@]}"
+done
 
 # Remove any system app that is no longer in the wanted list
 readarray -t INSTALLED < <(flatpak list --app --system --columns=application 2>/dev/null || true)
@@ -149,5 +193,29 @@ flatpak uninstall --system --noninteractive --unused || true
 # ── Save flatpak repo to build cache for next build ──────────────────────────
 echo "Saving flatpak repo to build cache..."
 mkdir -p "${FLATPAK_CACHE}"
-rsync -a --delete /var/lib/flatpak/repo/ "${FLATPAK_CACHE}/repo/"
+if command -v rsync >/dev/null 2>&1; then
+    rsync -a --delete /var/lib/flatpak/repo/ "${FLATPAK_CACHE}/repo/"
+else
+    # Stage into a sibling dir first so a failed copy cannot leave the cache
+    # empty: the warm repo is only replaced once the copy fully succeeds.
+    rm -rf "${FLATPAK_CACHE}/repo.new"
+    if cp -a /var/lib/flatpak/repo "${FLATPAK_CACHE}/repo.new"; then
+        rm -rf "${FLATPAK_CACHE}/repo.old"
+        if [ -d "${FLATPAK_CACHE}/repo" ]; then
+            mv "${FLATPAK_CACHE}/repo" "${FLATPAK_CACHE}/repo.old"
+        fi
+        mv "${FLATPAK_CACHE}/repo.new" "${FLATPAK_CACHE}/repo"
+        rm -rf "${FLATPAK_CACHE}/repo.old"
+    else
+        echo "WARNING: cache save failed; keeping previous warm cache" >&2
+        rm -rf "${FLATPAK_CACHE}/repo.new"
+    fi
+fi
 echo "Cache updated"
+
+# Do not ship the build-time machine id: every live boot would share it.
+# An empty file lets systemd generate one per boot, as it did before.
+if [[ "${CREATED_MACHINE_ID}" == 1 ]]; then
+    : > /etc/machine-id
+    rm -f /var/lib/dbus/machine-id
+fi

@@ -18,6 +18,14 @@ set -exo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Unified storage is not supported by the read-only live image and can
+# repeatedly restart while blocking the graphical target during E2E boots.
+# This mask is unconditional because it applies to every live ISO: the unit
+# can never succeed on live media, and the mask lives only in the live root,
+# so systems installed from this ISO keep bootc-unified-storage enabled.
+mkdir -p /etc/systemd/system
+ln -sfn /dev/null /etc/systemd/system/bootc-unified-storage.service
+
 cleanup_liveuser_home_bind() {
     if [[ "${LIVEUSER_HOME_BIND_ACTIVE:-0}" == "1" ]]; then
         # Only attempt to umount if /home is a mountpoint to avoid unmounting a
@@ -82,6 +90,33 @@ passwd --delete liveuser
 # Never enabled in production ISOs.
 if [[ "${DEBUG:-0}" == "1" ]]; then
     echo "liveuser:live" | chpasswd
+    # livesys-scripts (shipped in Bluefin bases, absent in GNOME OS) runs
+    # `passwd -d liveuser`/`passwd -d root` at every boot, wiping the debug
+    # passwords set here at build time. Re-assert them at boot, after livesys
+    # has run, so the debug logins work on those variants.
+    cat > /usr/lib/systemd/system/live-debug-passwords.service << 'PWUNIT'
+[Unit]
+Description=Re-assert live debug passwords (livesys wipes them at boot)
+After=livesys.service livesys-late.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bash -c "echo 'liveuser:live' | /usr/sbin/chpasswd; passwd --unlock root 2>/dev/null || true; echo 'root:root' | /usr/sbin/chpasswd"
+
+[Install]
+WantedBy=multi-user.target
+PWUNIT
+    mkdir -p /etc/systemd/system/multi-user.target.wants
+    ln -sf /usr/lib/systemd/system/live-debug-passwords.service \
+        /etc/systemd/system/multi-user.target.wants/live-debug-passwords.service
+    # The preset policy on these bases disables units it does not list, and
+    # `systemctl preset-all` at first boot would drop the wants symlink above.
+    # A preset file in /etc/systemd/system-preset/ takes priority over
+    # /usr/lib and forces the unit on. The sshd block below appends to this
+    # same file, so create it here and append there.
+    mkdir -p /etc/systemd/system-preset
+    echo "enable live-debug-passwords.service" \
+        > /etc/systemd/system-preset/90-live-debug.preset
 
     # Enable root login with a known password so hotfixes can be applied
     # directly via `ssh root@<ip>` or `su -` without going through sudo.
@@ -99,12 +134,18 @@ if [[ "${DEBUG:-0}" == "1" ]]; then
     SSH_UNIT="sshd.service"
     [[ ! -f /usr/lib/systemd/system/sshd.service && -f /usr/lib/systemd/system/ssh.service ]] && SSH_UNIT="ssh.service"
     mkdir -p /etc/systemd/system-preset
-    echo "enable ${SSH_UNIT}" > /etc/systemd/system-preset/90-live-debug.preset
+    echo "enable ${SSH_UNIT}" >> /etc/systemd/system-preset/90-live-debug.preset
     mkdir -p /etc/systemd/system/multi-user.target.wants
     ln -sf "/usr/lib/systemd/system/${SSH_UNIT}" \
         "/etc/systemd/system/multi-user.target.wants/${SSH_UNIT}"
 
+    mkdir -p /etc/ssh /etc/ssh/sshd_config.d
     cat >> /etc/ssh/sshd_config << 'SSHEOF'
+PermitEmptyPasswords no
+PasswordAuthentication yes
+PermitRootLogin yes
+SSHEOF
+    cat > /etc/ssh/sshd_config.d/00-live-debug.conf << 'SSHEOF'
 PermitEmptyPasswords no
 PasswordAuthentication yes
 PermitRootLogin yes
@@ -187,10 +228,14 @@ INSTALLER_APP_ID="org.bootcinstaller.Installer"
 # /usr/local -> /var/usrlocal and /var/usrlocal doesn't exist at build time.
 mkdir -p /usr/share/applications
 INSTALLER_DESKTOP_ID="${INSTALLER_APP_ID}.desktop"
+INSTALLER_ATSPI_ARGS=()
+if [[ "${DEBUG:-0}" == "1" ]]; then
+    INSTALLER_ATSPI_ARGS=(--env=GTK_MODULES=atk-bridge)
+fi
 cat > "/usr/share/applications/${INSTALLER_DESKTOP_ID}" << DESKTOPEOF
 [Desktop Entry]
 Name=Dakota Installer
-Exec=/usr/bin/flatpak run --branch=master --arch=x86_64 --command=bootc-installer ${INSTALLER_APP_ID}
+Exec=/usr/bin/flatpak run ${INSTALLER_ATSPI_ARGS[*]} --branch=master --arch=x86_64 --command=bootc-installer ${INSTALLER_APP_ID}
 Icon=dakota
 Terminal=false
 Type=Application
@@ -239,6 +284,18 @@ cat > /etc/dconf/db/distro.d/locks/50-live-iso << 'LOCKSEOF'
 /org/gnome/settings-daemon/plugins/power/sleep-inactive-battery-timeout
 LOCKSEOF
 
+if [[ "${DEBUG:-0}" == "1" ]]; then
+    cat >> /etc/dconf/db/distro.d/50-live-iso << 'DCONFEOF'
+
+[org/gnome/desktop/interface]
+toolkit-accessibility=true
+DCONFEOF
+
+    cat >> /etc/dconf/db/distro.d/locks/50-live-iso << 'LOCKSEOF'
+/org/gnome/desktop/interface/toolkit-accessibility
+LOCKSEOF
+fi
+
 dconf update || echo 'Warning: dconf update failed (will compile on first boot)'
 
 # Mask systemd sleep/suspend targets so the kernel never suspends regardless
@@ -270,9 +327,13 @@ fi
 # the squashed 9 GB dakota-nvidia image the uncompressed blob exceeds 8 GB, so
 # use 80% of total RAM so it scales with the machine (min system requirement
 # for the nvidia image is 16 GB, giving ~13 GB here).
+# ConditionKernelCommandLine=rd.live.image scopes the unit to live boots so an
+# 80%-of-RAM tmpfs on /var/tmp can never activate in a non-live boot of this
+# root filesystem.
 cat > /usr/lib/systemd/system/var-tmp.mount << 'UNITEOF'
 [Unit]
 Description=Large tmpfs for /var/tmp in the live environment
+ConditionKernelCommandLine=rd.live.image
 
 [Mount]
 What=tmpfs
@@ -334,6 +395,12 @@ TTYPath=/dev/ttyS0
 [Install]
 WantedBy=multi-user.target
 LREOF
+# live-ready.service ships in every build, not just DEBUG ones, so its preset
+# lives in its own file rather than the DEBUG-only 90-live-debug.preset.  The
+# preset policy on these bases disables units it does not list, and
+# `systemctl preset-all` at first boot would otherwise drop the enable below.
+mkdir -p /etc/systemd/system-preset
+echo "enable live-ready.service" > /etc/systemd/system-preset/90-live.preset
 systemctl enable live-ready.service || true
 
 # fisherman (tuna-installer backend) creates /var/fisherman-tmp and bind-mounts
@@ -373,7 +440,7 @@ install -Dm644 "$SCRIPT_DIR/images/dakotaraptor.png" /usr/share/bootc-installer/
 #   nvidia_imgref    — nvidia image ref used as local_imgref offline store
 #   bootloader       — "systemd" (default) or "grub"
 #   composefs        — "true" (default) or "false"
-#   flatpak_var_path — flatpak data path inside target (default: state/os/default/var/lib/flatpak)
+#   flatpak_var_path — unused; the installer reads flatpak_var_path from images.json, where it is the target's var root (fisherman appends lib/flatpak): state/os/default/var for composefs, omitted for ostree
 #   images_json      — variant-specific images.json (optional, overrides live/src/etc/bootc-installer/images.json)
 TARGET="${TARGET:-dakota-nvidia}"
 
@@ -472,7 +539,7 @@ mkdir -p /etc/xdg/autostart
 cat > /etc/xdg/autostart/tuna-installer.desktop << DTEOF
 [Desktop Entry]
 Name=Dakota Installer
-Exec=flatpak run --env=BOOTC_CUSTOM_RECIPE=/run/host/etc/bootc-installer/recipe.json ${INSTALLER_APP_ID}
+Exec=flatpak run ${INSTALLER_ATSPI_ARGS[*]} --env=BOOTC_CUSTOM_RECIPE=/run/host/etc/bootc-installer/recipe.json ${INSTALLER_APP_ID}
 Icon=dakota
 Type=Application
 X-GNOME-Autostart-enabled=true
@@ -486,7 +553,7 @@ cat > /usr/share/applications/dakota-installer.desktop << DTEOF
 [Desktop Entry]
 Name=Dakota Installer
 Comment=Install Dakota to your computer
-Exec=flatpak run --env=BOOTC_CUSTOM_RECIPE=/run/host/etc/bootc-installer/recipe.json ${INSTALLER_APP_ID}
+Exec=flatpak run ${INSTALLER_ATSPI_ARGS[*]} --env=BOOTC_CUSTOM_RECIPE=/run/host/etc/bootc-installer/recipe.json ${INSTALLER_APP_ID}
 Icon=dakota
 Type=Application
 Categories=System;

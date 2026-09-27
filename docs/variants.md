@@ -2,13 +2,44 @@
 
 How the Dakota ISO build target works.
 
+## Scope: dakota and utah
+
+This repo ships the Dakota and Utah ISOs. As of 2026-09-18 the `bluefin` and `bluefin-lts-hwe`
+variants no longer run on schedule. Nothing was deleted — the build targets, scripts,
+workflow files and variant config are intact.
+| Surface | State |
+|---|---|
+| `test-luks-install.yml` matrix | `variant: [dakota]`; `stable` / `lts` kept as a comment |
+| `test-plain-install.yml` matrix | `variant: [dakota]`; `stable` / `lts` kept as a comment |
+| `build-iso-bluefin.yml` | **enabled** for `workflow_dispatch` of `utah` (always pass `-f variant=utah`); `bluefin` and `bluefin-lts-hwe` dormant with schedules commented out |
+| `build-iso.yml` (dakota) | active |
+| Required checks on `main` | `LUKS E2E dakota (dev)`, `LUKS E2E dakota (stable)`, `ShellCheck` |
+
+The bluefin ISO build is disabled twice on purpose. The Actions-level disable stops it
+now; the commented-out `schedule` records the intent in version control, so re-enabling
+the workflow in the UI does not silently resume a nightly R2 publish.
+
+### Reviving a variant
+
+1. Uncomment the variant in the `test-luks-install.yml` / `test-plain-install.yml` matrix.
+2. For the bluefin ISO build, restore the `schedule:` block and re-enable the workflow:
+   ```bash
+   gh api -X PUT repos/projectbluefin/dakota-iso/actions/workflows/build-iso-bluefin.yml/enable
+   ```
+3. Add the corresponding `LUKS E2E <variant> (<channel>)` contexts to the
+   `main — review policy` ruleset.
+
+The `stable` and `lts` legs were red at the time of the change — `sshpass` got
+`Permission denied, please try again.` against the live VM (issues #155, #161,
+#163). Reviving them means fixing that first.
+
 ## Current build
 
-| Variant | Live env image | Payload (offline store) | Bootloader | Composefs | Filesystem |
-|---|---|---|---|---|---|
-| `dakota` | `projectbluefin/dakota-nvidia:stable` | same | systemd-boot | yes | btrfs |
-| `bluefin` | `projectbluefin/bluefin-nvidia:stable` | same | grub2 | no | btrfs |
-| `bluefin-lts-hwe` | `projectbluefin/bluefin-lts-hwe-nvidia:stable` | same | grub2 | no | btrfs |
+| Variant | Live env image | Payload (offline store) | Bootloader | Composefs | Filesystem | State |
+|---|---|---|---|---|---|---|
+| `dakota` | `projectbluefin/dakota-nvidia:stable` | same | systemd-boot | yes | btrfs | active |
+| `bluefin` | `projectbluefin/bluefin-nvidia:stable` | same | grub2 | no | btrfs | dormant |
+| `bluefin-lts-hwe` | `projectbluefin/bluefin-lts-hwe-nvidia:stable` | same | grub2 | no | btrfs | dormant |
 
 **All variants default to btrfs. XFS is available as a user-selectable option in the installer UI only.**
 
@@ -45,6 +76,45 @@ container target:
 
 The installer configs inside the ISO (`images.json`, `recipe.json`) are patched at
 build time to reference the correct image via `configure-live.sh`.
+
+## Reading variant config: `scripts/variant-config.sh`
+
+Every host-side read of per-variant config goes through one file,
+`scripts/variant-config.sh`. Source it and call a function — do not `cat` the
+config files inline:
+
+```bash
+source scripts/variant-config.sh          # from the repo root
+
+variant_live_target dakota                # → dakota-nvidia
+variant_tag dakota                        # → stable
+variant_registry dakota                   # → projectbluefin
+variant_bootloader_variant dakota         # → dakota   (live_target minus -nvidia/-nvidia-open)
+variant_composefs dakota                  # → true     (live/src/<bootloader-variant>/composefs)
+variant_bootloader dakota                 # → systemd  (live/src/<bootloader-variant>/bootloader)
+variant_bootloader_recipe bluefin         # → grub2    (fisherman's spelling of "grub")
+variant_composefs_json bluefin            # → false    (for a recipe.json field)
+```
+
+Two things this centralises:
+
+1. **The default set.** `live_target` defaults to the variant name, `tag` to
+   `stable`, `registry` to `projectbluefin`, `composefs` to `true`, and
+   `bootloader` to `systemd`. Those five defaults are now stated once. They
+   were previously restated at each call site, so adding a key or changing a
+   default meant finding every copy.
+
+2. **The namespace-B key derivation.** `composefs` and `bootloader` do *not*
+   live under `live/src/<variant>/` — they live under `live/src/<live_target
+   minus the -nvidia/-nvidia-open suffix>/`, because a variant can build its
+   live environment from an NVIDIA image while sharing bootloader config with
+   the non-NVIDIA one. That is why `lts` reads `live/src/bluefin-lts-hwe/`.
+   Getting this wrong returns defaults rather than an error, so it is worth
+   having in exactly one place.
+
+`payload_ref` and `live_title` are deliberately *not* exposed: `payload_ref`
+has no default (callers hard-error when it is missing) and `live_title` is
+free text that must not be whitespace-stripped.
 
 ## Adding a custom build target
 

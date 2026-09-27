@@ -10,6 +10,13 @@ embedded OCI store lets the installer deploy to non-NVIDIA hardware without a ne
 
 Home repo: [projectbluefin/dakota-iso](https://github.com/projectbluefin/dakota-iso)
 
+**Scope: dakota and utah.** Since 2026-09-18 `bluefin` and `bluefin-lts-hwe` are dormant —
+removed from the PR/schedule matrices in `test-luks-install.yml` and `test-plain-install.yml`.
+`build-iso-bluefin.yml` is enabled for manual dispatch of the `utah` variant (added in #216,
+published to R2 as `utah-live-latest.iso`), while scheduled triggers remain commented out.
+The bluefin and bluefin-lts-hwe code, docs and size invariants below are retained for revival,
+not for current CI. **Do not re-add bluefin or bluefin-lts-hwe to any workflow matrix.** Revival steps: [`docs/variants.md`](docs/variants.md).
+
 ## The System You Are Part Of
 
 ```
@@ -250,7 +257,7 @@ The `skill-drift.yml` CI check warns when a PR changes implementation files with
 
 - `.github/workflows/` — CI pipeline changes
 - `justfile` — canonical build interface
-- `live/src/build-iso.sh` — ISO assembly logic (canonical; `dakota/src/build-iso.sh` is the local-only copy)
+- `live/src/build-iso.sh` — ISO assembly logic (single source of truth for CI, `scripts/*.sh`, and local justfile recipes)
 - `live/src/configure-live.sh` — live environment setup
 - `live/src/install-flatpaks.sh` — Flatpak baking into squashfs
 

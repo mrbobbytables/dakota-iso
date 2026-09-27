@@ -22,7 +22,9 @@ Covered invariants
 5. Variant config files are complete and consistent for known variants.
 6. Release builds keep debug-only SSH/password config inside the DEBUG guard.
 7. build-iso.yml uploads to R2 only after the full install + verify gates pass.
-8. live/src/luks-unlock.py stays in sync with dakota/src/luks-unlock.py.
+
+live/src/ is the single source of truth for the live ISO source tree; there is
+no second copy to keep in sync.
 """
 
 import re
@@ -33,21 +35,20 @@ from pathlib import Path
 
 REPO = Path(__file__).parent.parent
 LIVE_BUILD_ISO = REPO / "live" / "src" / "build-iso.sh"
-DAKOTA_BUILD_ISO = REPO / "dakota" / "src" / "build-iso.sh"
 CONTAINERFILE = REPO / "live" / "Containerfile"
 CONFIGURE_LIVE = REPO / "live" / "src" / "configure-live.sh"
+GUI_E2E_JUSTFILE = REPO / "justfile"
 BUILD_ISO_WORKFLOW = REPO / ".github" / "workflows" / "build-iso.yml"
 BUILD_ISO_BLUEFIN_WORKFLOW = REPO / ".github" / "workflows" / "build-iso-bluefin.yml"
 TEST_LUKS_WORKFLOW = REPO / ".github" / "workflows" / "test-luks-install.yml"
 TEST_PLAIN_WORKFLOW = REPO / ".github" / "workflows" / "test-plain-install.yml"
 LIVE_LUKS_UNLOCK = REPO / "live" / "src" / "luks-unlock.py"
-DAKOTA_LUKS_UNLOCK = REPO / "dakota" / "src" / "luks-unlock.py"
 BUILD_LIVE_SQUASHFS = REPO / "scripts" / "build-live-squashfs.sh"
 ISO_SD_BOOT = REPO / "scripts" / "iso-sd-boot.sh"
 README = REPO / "README.md"
 
 # Variant directories that must be fully configured.
-KNOWN_VARIANTS = ["dakota", "bluefin", "bluefin-lts-hwe"]
+KNOWN_VARIANTS = ["dakota", "bluefin", "bluefin-lts-hwe", "utah"]
 
 # Required files in every variant directory.
 VARIANT_REQUIRED_FILES = ["payload_ref", "live_target", "tag", "registry"]
@@ -105,10 +106,6 @@ class TestBootCmdline(unittest.TestCase):
         """live/src/build-iso.sh must use LABEL=, not CDLABEL= or /dev/sr0."""
         self._check_boot_root(LIVE_BUILD_ISO)
 
-    def test_dakota_build_iso_uses_label_not_cdlabel_or_sr0(self):
-        """dakota/src/build-iso.sh must use LABEL=, not CDLABEL= or /dev/sr0."""
-        self._check_boot_root(DAKOTA_BUILD_ISO)
-
     def test_live_build_iso_contains_label_root(self):
         """live/src/build-iso.sh boot entries must use root=live:LABEL=DAKOTA_LIVE."""
         self._check_has_label(LIVE_BUILD_ISO)
@@ -133,10 +130,6 @@ class TestBootCmdline(unittest.TestCase):
     def test_live_build_iso_has_nvidia_drm_modeset(self):
         """All live/src/build-iso.sh boot entries must include nvidia-drm.modeset=1."""
         self._check_nvidia_modeset(LIVE_BUILD_ISO)
-
-    def test_dakota_build_iso_has_nvidia_drm_modeset(self):
-        """All dakota/src/build-iso.sh boot entries must include nvidia-drm.modeset=1."""
-        self._check_nvidia_modeset(DAKOTA_BUILD_ISO)
 
 
 class TestXfsprogs(unittest.TestCase):
@@ -248,6 +241,15 @@ class TestInitramfsSelectionLogic(unittest.TestCase):
             native,
             "Native dracut must include iso9660 or live boot cannot mount the ISO.",
         )
+
+    def test_initramfs_forces_iso9660_driver_early(self):
+        """Live boot must load isofs before mounting the ISO."""
+        force_lines = [
+            line for line in self.content.splitlines() if "--force-drivers" in line
+        ]
+        self.assertGreaterEqual(len(force_lines), 2)
+        for line in force_lines:
+            self.assertIn("isofs", line)
 
     def test_debian_stage_reads_dracut_status(self):
         """Debian stage must check dracut-status to decide whether to cross-build."""
@@ -398,6 +400,204 @@ class TestConfigureLiveSyntax(unittest.TestCase):
             "on Fedora Silverblue /usr/local is a dangling symlink to "
             "/var/usrlocal which doesn't exist at container build time. "
             "Use /usr/share/applications/ instead.",
+        )
+
+    def test_auto_launched_installer_enables_atspi_only_in_debug_builds(self):
+        """Production ISOs must not receive GUI-test AT-SPI forcing."""
+        content = CONFIGURE_LIVE.read_text()
+        debug_guard = 'if [[ "${DEBUG:-0}" == "1" ]]; then'
+
+        for marker in (
+            "--env=GTK_MODULES=atk-bridge",
+            "toolkit-accessibility=true",
+            "/org/gnome/desktop/interface/toolkit-accessibility",
+        ):
+            self.assertEqual(
+                content.count(marker),
+                1,
+                f"{marker!r} must occur exactly once so it cannot leak to production.",
+            )
+            marker_index = content.index(marker)
+            guard_index = content.rfind(debug_guard, 0, marker_index)
+            self.assertNotEqual(
+                guard_index,
+                -1,
+                f"{marker!r} must be guarded by DEBUG=1.",
+            )
+            guard_end = content.find("\nfi", guard_index)
+            self.assertGreater(
+                guard_end,
+                marker_index,
+                f"{marker!r} must remain inside its DEBUG=1 guard.",
+            )
+        self.assertIn(
+            "Exec=flatpak run ${INSTALLER_ATSPI_ARGS[*]} "
+            "--env=BOOTC_CUSTOM_RECIPE=",
+            content,
+            "The debug-only ATK bridge argument must reach the auto-launch "
+            "desktop entry, not only the dock shortcut.",
+        )
+        self.assertEqual(
+            content.count(
+                "Exec=flatpak run ${INSTALLER_ATSPI_ARGS[*]} "
+                "--env=BOOTC_CUSTOM_RECIPE="
+            ),
+            2,
+            "Both the auto-launch and matching dock entry must retain the "
+            "debug-only ATK bridge argument.",
+        )
+
+
+class TestAtspiDriverRuntime(unittest.TestCase):
+    """The driver must use a binding the GNOME OS live image already provides."""
+
+    def test_driver_uses_the_gnome_os_gobject_atspi_binding(self):
+        """Do not add a cross-distro pyatspi package to the final image."""
+        content = (REPO / "scripts" / "atspi-installer-driver.py").read_text()
+        self.assertIn(
+            'gi.require_version("Atspi", "2.0")',
+            content,
+            "The driver must select the installed AT-SPI introspection namespace.",
+        )
+        self.assertIn(
+            "from gi.repository import Atspi",
+            content,
+            "The driver must use GNOME OS's PyGObject binding.",
+        )
+        self.assertIn(
+            "if atspi.init() not in (0, 1):",
+            content,
+            "The driver must initialize the AT-SPI accessibility bus before "
+            "requesting the desktop tree.",
+        )
+        self.assertNotIn(
+            "import pyatspi",
+            content,
+            "The driver must not rely on an unprovisioned pyatspi package.",
+        )
+        self.assertIn(
+            "node.get_action()",
+            content,
+            "The driver must use the current GObject-introspection action API.",
+        )
+        self.assertNotIn(
+            "queryAction",
+            content,
+            "The pyatspi-only action API is unavailable through gi.repository.Atspi.",
+        )
+
+    def test_gui_e2e_checks_the_driver_dependency_in_the_debug_iso(self):
+        """The GUI test must import its AT-SPI binding in the guest before UI actions."""
+        content = GUI_E2E_JUSTFILE.read_text()
+        recipe_start = content.index("gui-e2e target:")
+        recipe_end = content.index("\n# Boot the live ISO", recipe_start)
+        gui_e2e = content[recipe_start:recipe_end]
+        debug_iso_check = '[[ -f "{{output_dir}}/{{target}}-debug-live.iso" ]]'
+        scratch_prepare = 'echo "Mounting scratch disk (/dev/vdb) over /var/tmp..."'
+        scratch_format = "mkfs.ext4 -F /dev/vdb >/dev/null"
+        scratch_unmount = "umount /var/tmp 2>/dev/null || true"
+        scratch_mount = "mount /dev/vdb /var/tmp"
+        dependency_check = "--check-dependencies"
+        driver_run = "--timeout 2700"
+        driver_status = 'DRIVER_STATUS="${PIPESTATUS[0]}"'
+        installer_log_collection = '} > "${INSTALLER_LOG}"'
+        driver_failure_exit = 'exit "${DRIVER_STATUS}"'
+        bls_patch = 'echo "Patching BLS entries to add serial console..."'
+
+        self.assertIn(
+            debug_iso_check,
+            gui_e2e,
+            "gui-e2e must reject a production ISO before it starts QEMU.",
+        )
+        self.assertIn(
+            dependency_check,
+            gui_e2e,
+            "gui-e2e must import the driver's AT-SPI binding in the debug guest.",
+        )
+        self.assertIn(
+            scratch_format,
+            gui_e2e,
+            "gui-e2e must format its dedicated scratch disk in the debug guest.",
+        )
+        self.assertIn(
+            scratch_unmount,
+            gui_e2e,
+            "gui-e2e must replace the live image's /var/tmp mount safely.",
+        )
+        self.assertIn(
+            scratch_mount,
+            gui_e2e,
+            "gui-e2e must mount the formatted scratch disk over /var/tmp.",
+        )
+        self.assertLess(
+            gui_e2e.index(scratch_prepare),
+            gui_e2e.index(scratch_format),
+            "gui-e2e must format /dev/vdb after identifying scratch preparation.",
+        )
+        self.assertLess(
+            gui_e2e.index(scratch_format),
+            gui_e2e.index(scratch_unmount),
+            "gui-e2e must format the scratch disk before replacing /var/tmp.",
+        )
+        self.assertLess(
+            gui_e2e.index(scratch_unmount),
+            gui_e2e.index(scratch_mount),
+            "gui-e2e must unmount the live /var/tmp before mounting /dev/vdb.",
+        )
+        self.assertLess(
+            gui_e2e.index(scratch_mount),
+            gui_e2e.index(dependency_check),
+            "gui-e2e must prepare disk-backed /var/tmp before the AT-SPI probe.",
+        )
+        self.assertLess(
+            gui_e2e.index(scratch_prepare),
+            gui_e2e.index(driver_run),
+            "gui-e2e must prepare disk-backed /var/tmp before the AT-SPI driver.",
+        )
+        self.assertLess(
+            gui_e2e.index(dependency_check),
+            gui_e2e.index(driver_run),
+            "The debug ISO dependency check must run before the destructive UI driver.",
+        )
+        self.assertIn(
+            driver_status,
+            gui_e2e,
+            "gui-e2e must preserve the AT-SPI driver's status from its tee pipeline.",
+        )
+        self.assertIn(
+            installer_log_collection,
+            gui_e2e,
+            "gui-e2e must collect installer logs after the AT-SPI driver exits.",
+        )
+        self.assertIn(
+            driver_failure_exit,
+            gui_e2e,
+            "gui-e2e must return the original driver failure after log collection.",
+        )
+        self.assertLess(
+            gui_e2e.index("set +e"),
+            gui_e2e.index(driver_run),
+            "gui-e2e must temporarily disable errexit around the driver pipeline.",
+        )
+        self.assertLess(
+            gui_e2e.index(driver_run),
+            gui_e2e.index(driver_status),
+            "gui-e2e must capture the driver status immediately after its pipeline.",
+        )
+        self.assertLess(
+            gui_e2e.index(driver_status),
+            gui_e2e.index(installer_log_collection),
+            "gui-e2e must collect installer logs after recording driver failure.",
+        )
+        self.assertLess(
+            gui_e2e.index(installer_log_collection),
+            gui_e2e.index(driver_failure_exit),
+            "gui-e2e must collect installer logs before returning driver failure.",
+        )
+        self.assertLess(
+            gui_e2e.index(driver_failure_exit),
+            gui_e2e.index(bls_patch),
+            "gui-e2e must not attempt BLS or boot validation after driver failure.",
         )
 
     def test_configure_live_binds_var_home_while_creating_liveuser(self):
@@ -650,6 +850,25 @@ class TestReleaseSafetyInvariants(unittest.TestCase):
                 f"{workflow.name} must define workflow-level concurrency.",
             )
 
+    def test_e2e_workflows_define_push_concurrency(self):
+        """Expensive post-merge E2E runs must cancel superseded runs on push."""
+        for workflow in [TEST_LUKS_WORKFLOW, TEST_PLAIN_WORKFLOW]:
+            content = workflow.read_text()
+            self.assertIn(
+                "\nconcurrency:\n",
+                content,
+                f"{workflow.name} must define concurrency.",
+            )
+            self.assertIn(
+                "cancel-in-progress: ${{ github.event_name == 'push' }}",
+                content,
+                f"{workflow.name} must cancel in-progress runs on push events.",
+            )
+            self.assertIn(
+                "paths-ignore:",
+                content,
+                f"{workflow.name} should ignore doc-only pushes.",
+            )
     def test_build_iso_rotates_and_prunes_dakota_backups(self):
         """Dakota publisher must maintain exactly 3 backup ISO slots."""
         content = BUILD_ISO_WORKFLOW.read_text()
@@ -706,7 +925,7 @@ class TestReleaseSafetyInvariants(unittest.TestCase):
     def test_readme_download_table_has_last_three_builds_links(self):
         """README top download table must expose latest + last 3 dakota backups."""
         content = README.read_text()
-        top_table_section = content.split("\nBuilds bootable UEFI live ISOs", 1)[0]
+        top_table_section = content.split("\n## Variants", 1)[0]
         self.assertIn(
             "| Variant | Download | Checksum | Size | Published (UTC) | Validation | Last 3 builds |",
             top_table_section,
@@ -732,7 +951,7 @@ class TestReleaseSafetyInvariants(unittest.TestCase):
     def test_readme_bluefin_rows_link_last_three_builds(self):
         """README bluefin/bluefin-lts-hwe rows must link backup slots 1..3."""
         content = README.read_text()
-        top_table_section = content.split("\nBuilds bootable UEFI live ISOs", 1)[0]
+        top_table_section = content.split("\n## Variants", 1)[0]
 
         for prefix, iso_base in (
             ("`bluefin`", "bluefin-live"),
@@ -764,17 +983,6 @@ class TestReleaseSafetyInvariants(unittest.TestCase):
             TEST_LUKS_WORKFLOW.read_text(),
             "test-luks-install.yml must gate luks-e2e on unit-tests.",
         )
-
-    def test_luks_unlock_copies_are_identical(self):
-        """live/ and dakota/ luks-unlock helpers must stay byte-for-byte aligned."""
-        self.assertEqual(
-            LIVE_LUKS_UNLOCK.read_text(),
-            DAKOTA_LUKS_UNLOCK.read_text(),
-            "live/src/luks-unlock.py and dakota/src/luks-unlock.py diverged. "
-            "Keep them identical so CI/build logic and local helpers exercise "
-            "the same unlock behavior.",
-        )
-
 
 class TestVariantConfig(unittest.TestCase):
     """Variant directories must be complete and consistent."""
@@ -876,6 +1084,29 @@ class TestVariantConfig(unittest.TestCase):
                 )
 
 
+    def test_workflow_payload_matches_offline_nvidia_imgref(self):
+        """For non-composefs variants, build-iso-bluefin.yml payload_image must match live/src/<variant>/nvidia_imgref."""
+        content = BUILD_ISO_BLUEFIN_WORKFLOW.read_text()
+        for variant in ["bluefin", "bluefin-lts-hwe", "utah"]:
+            nvidia_file = REPO / "live" / "src" / variant / "nvidia_imgref"
+            if nvidia_file.exists():
+                nvidia_ref = nvidia_file.read_text().strip()
+                # Find the matrix payload_image for this variant
+                m = re.search(
+                    rf"- variant:\s*{re.escape(variant)}\s+payload_image:\s*([^\s]+)",
+                    content,
+                )
+                self.assertIsNotNone(
+                    m, f"Could not find variant {variant} payload_image in {BUILD_ISO_BLUEFIN_WORKFLOW.name}"
+                )
+                payload_image = m.group(1).strip()
+                self.assertEqual(
+                    payload_image,
+                    nvidia_ref,
+                    f"Variant {variant} payload_image ({payload_image}) in {BUILD_ISO_BLUEFIN_WORKFLOW.name} "
+                    f"must match live/src/{variant}/nvidia_imgref ({nvidia_ref}) so offline installs find the image in local store.",
+                )
+
 class TestBuildIsoScript(unittest.TestCase):
     """Static analysis of build-iso.sh for correctness invariants."""
 
@@ -889,41 +1120,6 @@ class TestBuildIsoScript(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0,
                          f"live/src/build-iso.sh syntax error:\n{result.stderr}")
-
-    def test_dakota_build_iso_bash_syntax(self):
-        result = subprocess.run(
-            ["bash", "-n", str(DAKOTA_BUILD_ISO)],
-            capture_output=True, text=True,
-        )
-        self.assertEqual(result.returncode, 0,
-                         f"dakota/src/build-iso.sh syntax error:\n{result.stderr}")
-
-    def test_build_iso_scripts_are_in_sync(self):
-        """live/ and dakota/ build-iso.sh must have identical boot cmdlines.
-
-        These two scripts serve different entry points (CI vs local justfile)
-        but must stay in sync on the boot cmdline to prevent split-brain bugs
-        where CI builds boot with different options than local test builds.
-        """
-        live_content = LIVE_BUILD_ISO.read_text()
-        dakota_content = DAKOTA_BUILD_ISO.read_text()
-
-        def extract_boot_lines(content):
-            return [
-                ln.strip() for ln in content.splitlines()
-                if ("root=live:" in ln or "rd.live." in ln)
-                and not ln.strip().startswith("#")
-            ]
-
-        live_boot = extract_boot_lines(live_content)
-        dakota_boot = extract_boot_lines(dakota_content)
-
-        self.assertEqual(
-            live_boot, dakota_boot,
-            "live/src/build-iso.sh and dakota/src/build-iso.sh have different "
-            "boot cmdline options. These files must be kept in sync.\n"
-            f"live:   {live_boot}\ndakota: {dakota_boot}",
-        )
 
 
 if __name__ == "__main__":
@@ -954,6 +1150,71 @@ class TestBuildLiveSquashfs(unittest.TestCase):
             "build-live-squashfs.sh contains broken Python quoting for "
             "composeFsBackend detection: open() path inside sh -c single-quotes "
             "breaks the -c argument. Use grep or pipe to python instead.",
+        )
+
+    def test_composefs_payload_commit_squash(self):
+        """Every `buildah commit` in the composefs payload path must pass --squash.
+
+        Chunkified payload images carry ~120 layers. Committing them without
+        --squash explodes the VFS containers-storage directory embedded in the
+        squashfs, inflating ISOs from ~5 GB to ~12 GB (recurring regression
+        documented in AGENTS.md).
+        """
+        lines = BUILD_LIVE_SQUASHFS.read_text().splitlines()
+
+        start = next(
+            (i for i, l in enumerate(lines) if "embedding OCI image" in l and "composefs path" in l),
+            None,
+        )
+        self.assertIsNotNone(start, "composefs payload embedding block not found")
+        end = next(
+            (i for i, l in enumerate(lines[start:], start) if l.strip() == "else"),
+            len(lines),
+        )
+
+        commits = [l.strip() for l in lines[start:end] if re.search(r"\bbuildah commit\b", l)]
+        self.assertTrue(commits, "no `buildah commit` found in the composefs payload path")
+        for commit in commits:
+            self.assertIn(
+                "--squash",
+                commit,
+                f"`buildah commit` in the composefs payload path is missing --squash: {commit!r}. "
+                "Omitting --squash inflates ISO size from ~5 GB to ~12 GB.",
+            )
+
+    def test_build_live_squashfs_rejects_missing_positional_args(self):
+        """Positional mode must fail fast when image/output paths are absent.
+
+        The script relies on `${N:?...}` expansions so a missing <image>,
+        <output-squashfs> or <output-boot-tar> aborts with the usage message
+        instead of silently producing an empty or misplaced artifact.
+        """
+        content = BUILD_LIVE_SQUASHFS.read_text()
+        for var in ("${1:?", "${2:?", "${3:?"):
+            self.assertIn(
+                var,
+                content,
+                f"build-live-squashfs.sh must enforce positional argument via {var}...}} "
+                "so missing arguments fail with the usage message.",
+            )
+        self.assertIn(
+            "Usage: build-live-squashfs.sh",
+            content,
+            "build-live-squashfs.sh must print a usage string when positional args are missing",
+        )
+
+    def test_build_live_squashfs_target_mode_enforces_output_dir(self):
+        """Target mode (--target) must abort when --output-dir is not supplied.
+
+        Without the guard the script would default the output path and write
+        artifacts where the caller (justfile / CI) does not look for them.
+        """
+        content = BUILD_LIVE_SQUASHFS.read_text()
+        self.assertRegex(
+            content,
+            r'-z\s+"\$\{OUTPUT_DIR\}"\s*\]\]\s*&&\s*\{[^}]*--target requires --output-dir[^}]*exit 1',
+            "build-live-squashfs.sh must exit 1 with 'ERROR: --target requires --output-dir' "
+            "when --target is used without --output-dir",
         )
 
     def test_lts_images_json_defaults_to_btrfs(self):
@@ -1004,6 +1265,123 @@ class TestBuildLiveSquashfs(unittest.TestCase):
                     "Must use '$SOCAT_PREFIX socat' to support root-owned sockets "
                     "when QEMU runs with sudo."
                 )
+
+    def test_justfile_chunkify_does_not_unconditionally_disable_tls_verify(self):
+        """justfile chunkify must not push with unconditional --tls-verify=false."""
+        justfile = REPO / "justfile"
+        content = justfile.read_text()
+        self.assertNotIn(
+            "podman push --tls-verify=false",
+            content,
+            "justfile chunkify must not unconditionally disable TLS verification on push",
+        )
+
+    # Destination refs that must / must not get --tls-verify=false from
+    # `just chunkify`. A plaintext push is only safe to a genuinely local
+    # or RFC1918 registry; anything a resolver could point elsewhere —
+    # including a dotted suffix on a local name and an out-of-range octet
+    # that is therefore a DNS name, not an address — must keep TLS on.
+    CHUNKIFY_TLS_ALLOW = (
+        "localhost/dakota:chunked",
+        "localhost:5000/dakota:chunked",
+        "127.0.0.1/x:y",
+        "[::1]:5000/dakota:chunked",
+        "192.168.122.1:5000/dakota:chunked",
+        "10.255.255.254/x:y",
+        "172.31.255.255:5000/x:y",
+        "192.168.0.1/x:y",
+    )
+    CHUNKIFY_TLS_DENY = (
+        "10.999.999.999/x:y",
+        "192.168.999.1:5000/x:y",
+        "172.16.300.1/x:y",
+        "256.1.1.1/x:y",
+        "localhost.evil.com/x:y",
+        "192.168.evil.com/x:y",
+        "10.0.0.5.evil.com:5000/x:y",
+        "192.168.1.1.evil.com/x:y",
+        "172.32.0.1/x:y",
+        "172.15.0.1/x:y",
+        "ghcr.io/projectbluefin/dakota:chunked",
+        "myhost/localhost:tag",
+        "host.local/x:y",
+    )
+
+    def _chunkify_tls_decisions(self, destinations):
+        """Run the justfile's own push-TLS `case` block against each ref.
+
+        The block is lifted verbatim out of the recipe so this test cannot
+        drift from what `just chunkify` actually executes. It runs one ref
+        per shell: `shopt -s extglob` only affects patterns parsed after
+        it, so the block must stay at the top level of the script.
+        """
+        content = (REPO / "justfile").read_text()
+        match = re.search(
+            r"^    PUSH_TLS_ARGS=\(\)\n(?:.*\n)*?^    esac$",
+            content,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(
+            match, "chunkify push-TLS case block not found in justfile"
+        )
+        block = re.sub(r"^    ", "", match.group(0), flags=re.MULTILINE)
+        script = (
+            'dst="$1"\n'
+            + block.replace("{{dst}}", "${dst}")
+            + '\nprintf "%s\\n" "${PUSH_TLS_ARGS[*]}"\n'
+        )
+        decisions = {}
+        for dst in destinations:
+            res = subprocess.run(
+                ["bash", "-c", script, "bash", dst],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                res.returncode, 0, f"case block failed for {dst}:\n{res.stderr}"
+            )
+            decisions[dst] = res.stdout.strip()
+        return decisions
+
+    def test_justfile_chunkify_disables_tls_only_for_local_registries(self):
+        """Only local/RFC1918 push targets may skip TLS verification."""
+        destinations = self.CHUNKIFY_TLS_ALLOW + self.CHUNKIFY_TLS_DENY
+        decisions = self._chunkify_tls_decisions(destinations)
+        for dst in self.CHUNKIFY_TLS_ALLOW:
+            with self.subTest(dst=dst, expected="--tls-verify=false"):
+                self.assertEqual(
+                    decisions[dst],
+                    "--tls-verify=false",
+                    f"{dst} is a local registry; chunkify must push it with "
+                    "--tls-verify=false",
+                )
+        for dst in self.CHUNKIFY_TLS_DENY:
+            with self.subTest(dst=dst, expected=""):
+                self.assertEqual(
+                    decisions[dst],
+                    "",
+                    f"{dst} is not a local registry; chunkify must keep TLS "
+                    "verification enabled when pushing to it",
+                )
+
+    def test_justfile_third_party_images_are_digest_pinned(self):
+        """Third-party container images in justfile recipes must be digest-pinned.
+
+        Prevents supply-chain tampering where mutable tags (e.g. :latest)
+        execute attacker-controlled code with elevated privileges.
+        """
+        justfile = REPO / "justfile"
+        content = justfile.read_text()
+        self.assertRegex(
+            content,
+            r"ghcr\.io/tuna-os/chunkah:latest@sha256:[0-9a-f]{64}",
+            "chunkah image in justfile must be pinned with sha256 digest",
+        )
+        self.assertRegex(
+            content,
+            r"ghcr\.io/qemus/qemu:7\.50@sha256:[0-9a-f]{64}",
+            "qemus/qemu image in justfile must be pinned with version tag and sha256 digest",
+        )
 
 
 class TestPayloadPristine(unittest.TestCase):

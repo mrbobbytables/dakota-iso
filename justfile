@@ -99,14 +99,15 @@ _payload_ref_flag target:
 
 container target:
     #!/usr/bin/bash
+    source scripts/variant-config.sh
     test -f "{{target}}/payload_ref" || { echo "ERROR: {{target}}/payload_ref not found — create it with the base image reference, e.g.: echo 'ghcr.io/projectbluefin/dakota:latest' > {{target}}/payload_ref"; exit 1; }
     # live_target overrides the Containerfile TARGET build-arg when the live
     # environment image differs from the variant directory name.
     # e.g. the 'dakota' variant builds its live env from 'dakota-nvidia' so all
     # hardware can boot live, while payload_ref controls the offline store.
-    LIVE_TARGET=$(cat "{{target}}/live_target" 2>/dev/null | tr -d '[:space:]' || echo "{{target}}")
-    LIVE_TAG=$(cat "{{target}}/tag" 2>/dev/null | tr -d '[:space:]' || echo "stable")
-    LIVE_REGISTRY=$(cat "{{target}}/registry" 2>/dev/null | tr -d '[:space:]' || echo "projectbluefin")
+    LIVE_TARGET=$(variant_live_target "{{target}}")
+    LIVE_TAG=$(variant_tag "{{target}}")
+    LIVE_REGISTRY=$(variant_registry "{{target}}")
     podman build --cap-add sys_admin --security-opt label=disable \
         --layers \
         --build-arg DEBUG={{debug}} \
@@ -122,8 +123,7 @@ container target:
 # Builds the live environment container from live/Containerfile, then assembles
 # the ISO on the host using build-iso.sh.  This produces a single-variant ISO
 # for local testing.  CI builds a unified ISO with both NVIDIA (live) and
-# non-NVIDIA (offline store) variants — see scripts/build-live-squashfs.sh and
-# scripts/build-offline-store.sh.
+# non-NVIDIA (offline store) variants — see scripts/build-live-squashfs.sh.
 #
 # Output: output/<target>-live.iso
 iso-sd-boot target:
@@ -141,6 +141,13 @@ iso target:
 #
 # Pulls the source image, runs chunkah to produce a zstd:chunked OCI archive,
 # loads the result into podman, and pushes it to the destination ref.
+#
+# TLS: the push only disables certificate verification for local destinations
+# (localhost, 127.0.0.1, [::1], and RFC1918 addresses). Every other
+# destination — including hostname-addressed LAN registries such as
+# registry.lan:5000 or myhost.local:5000 — is pushed with TLS verification on.
+# For a self-signed LAN registry, add it to containers-registries.conf(5) with
+# insecure = true rather than turning verification off globally.
 #
 # Usage:
 #   just chunkify ghcr.io/projectbluefin/dakota:latest 192.168.122.1:5000/dakota:chunked
@@ -162,7 +169,7 @@ chunkify src dst:
         --entrypoint="" \
         -v "${CHUNK_OUT}:/run/out:Z" \
         --mount "type=image,source={{src}},target=/chunkah" \
-        ghcr.io/tuna-os/chunkah:latest \
+        ghcr.io/tuna-os/chunkah:latest@sha256:338ac4086ed919cf511cfca5e00317a3f65db27df86d76e833775ed07237b2dc \
         sh -c 'chunkah build > /run/out/out.ociarchive'
 
     echo "==> Loading rechunked archive..."
@@ -174,7 +181,19 @@ chunkify src dst:
 
     echo "==> Tagging and pushing to {{dst}}..."
     podman tag "${LOADED_ID}" "{{dst}}"
-    podman push --tls-verify=false "{{dst}}"
+    PUSH_TLS_ARGS=()
+    shopt -s extglob
+    case "{{dst}}" in
+        localhost|localhost:+([0-9])|localhost/*|localhost:+([0-9])/* | \
+        127.0.0.1|127.0.0.1:+([0-9])|127.0.0.1/*|127.0.0.1:+([0-9])/* | \
+        '[::1]'|'[::1]:'+([0-9])|'[::1]/'*|'[::1]:'+([0-9])/* | \
+        10.@(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9]).@(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9]).@(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])?(:+([0-9]))?(/*) | \
+        192.168.@(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9]).@(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])?(:+([0-9]))?(/*) | \
+        172.@(1[6-9]|2[0-9]|3[01]).@(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9]).@(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])?(:+([0-9]))?(/*))
+            PUSH_TLS_ARGS+=(--tls-verify=false)
+            ;;
+    esac
+    podman push "${PUSH_TLS_ARGS[@]}" "{{dst}}"
 
     echo "==> Done: {{dst}}"
 
@@ -271,7 +290,7 @@ run-iso target:
     run_args+=(--env "GPU=Y")
     run_args+=(--device=/dev/kvm)
     run_args+=(--volume "${PWD}/output/${image_name}":"/boot.iso")
-    run_args+=(ghcr.io/qemus/qemu)
+    run_args+=(ghcr.io/qemus/qemu:7.50@sha256:e7f6fda52503a546fd649670ba46e4bc23dc6dcef275bc3fac48877fbbc430df)
     xdg-open http://localhost:${port} &
     podman run "${run_args[@]}"
     echo "Connect to http://localhost:${port}"
@@ -489,6 +508,7 @@ boot-libvirt-debug target:
 luks-install target:
     #!/usr/bin/bash
     set -euo pipefail
+    source scripts/variant-config.sh
 
     VM_NAME="dakota-debug"
     PASSPHRASE="{{luks-passphrase}}"
@@ -537,13 +557,9 @@ luks-install target:
     # just's parser (it sees the closing ) at column 0 as a delimiter).
     RECIPE_TMP=$(mktemp /tmp/luks-recipe-XXXXXX.json)
     trap "rm -f '${RECIPE_TMP}'" EXIT
-    LIVE_TARGET=$(cat "{{target}}/live_target" 2>/dev/null | tr -d '[:space:]' || echo "{{target}}")
-    BOOTLOADER_VARIANT=$(echo "$LIVE_TARGET" | sed 's/-nvidia-open$//;s/-nvidia$//')
-    COMPOSEFS_BACKEND=$(cat "live/src/${BOOTLOADER_VARIANT}/composefs" 2>/dev/null | tr -d '[:space:]' || echo "true")
-    BOOTLOADER=$(cat "live/src/${BOOTLOADER_VARIANT}/bootloader" 2>/dev/null | tr -d '[:space:]' || echo "systemd")
-    if [[ "${BOOTLOADER}" == "grub" ]]; then BOOTLOADER="grub2"; fi
+    BOOTLOADER=$(variant_bootloader_recipe "{{target}}")
     printf '{\n  "disk": "%s",\n  "filesystem": "btrfs",\n  "image": "containers-storage:'"${PAYLOAD_IMAGE}"'",\n  "composeFsBackend": %s,\n  "bootloader": "%s",\n  "hostname": "dakota-luks-test",\n  "encryption": {"type": "luks-passphrase", "passphrase": "%s"},\n  "flatpaks": []\n}\n' \
-        "${DISK}" "$([ "${COMPOSEFS_BACKEND}" == "true" ] && echo "true" || echo "false")" "${BOOTLOADER}" "${PASSPHRASE}" > "${RECIPE_TMP}"
+        "${DISK}" "$(variant_composefs_json "{{target}}")" "${BOOTLOADER}" "${PASSPHRASE}" > "${RECIPE_TMP}"
     $SCP "${RECIPE_TMP}" liveuser@"$GUEST_IP":/tmp/luks-recipe.json
     echo "Uploaded recipe to /tmp/luks-recipe.json"
 
@@ -600,7 +616,7 @@ luks-unlock target:
     fi
     echo "Waiting for Plymouth passphrase prompt (VM MAC: ${MAC})..."
     echo "Passphrase: ${PASSPHRASE}"
-    sudo python3 "dakota/src/luks-unlock.py" libvirt "$VM_NAME" "$PASSPHRASE" "$MAC"
+    sudo python3 "live/src/luks-unlock.py" libvirt "$VM_NAME" "$PASSPHRASE" "$MAC"
 
 # Connect to the serial console of the dakota-debug VM to watch boot after
 # luks-install.  At the LUKS passphrase prompt type the passphrase (default:
@@ -850,7 +866,7 @@ luks-boot-qemu-live target:
     done
 
     # Wait for the live boot GUI to render and stabilize before taking screenshot
-    sudo python3 "dakota/src/luks-unlock.py" wait-live \
+    sudo python3 "live/src/luks-unlock.py" wait-live \
         "{{luks-qemu-monitor-live}}" \
         "/tmp/luks-screenshot-live.ppm" || true
 
@@ -946,7 +962,7 @@ luks-unlock-qemu target:
     PASSPHRASE="{{luks-passphrase}}"
     echo "Unlocking LUKS on installed QEMU VM..."
     echo "Passphrase: ${PASSPHRASE}"
-    sudo python3 "dakota/src/luks-unlock.py" qemu \
+    sudo python3 "live/src/luks-unlock.py" qemu \
         "{{luks-qemu-monitor-installed}}" \
         "$PASSPHRASE" \
         "{{luks-qemu-serial-installed}}"
@@ -954,7 +970,7 @@ luks-unlock-qemu target:
     # Show key screenshots inline for terminals that support it (Kitty, iTerm2, etc.)
     for label in "Plymouth prompt" "Final boot"; do
         key=$(echo "$label" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')
-        bash "dakota/src/show-screenshot.sh" "/tmp/luks-screenshot-${key}.ppm" "$label" || true
+        bash "live/src/show-screenshot.sh" "/tmp/luks-screenshot-${key}.ppm" "$label" || true
     done
 
 # Post-boot assertions against the unlocked, installed LUKS system
@@ -970,6 +986,13 @@ luks-verify-qemu target:
 # It does NOT mean the ISO builds or installs correctly — see test-luks-install.yml / test-plain-install.yml.
 test:
     pytest tests/ -v
+
+# Pre-commit gate. Run before every commit.
+# Wraps the two checks CI enforces: the pytest suite (test.yml) and the
+# pre-commit hooks (yaml/json validation, actionlint, action-pin policy).
+check:
+    pytest tests/ -v
+    pre-commit run --all-files
 
 # ────────────────────────────────────────────────────────────────────────────
 # Plain (unencrypted) composefs install E2E test
@@ -1010,6 +1033,7 @@ plain-e2e target:
 plain-enospc-gate target:
     #!/usr/bin/bash
     set -euo pipefail
+    source scripts/variant-config.sh
     PAYLOAD_IMAGE=$(cat "{{target}}/payload_ref" | tr -d '[:space:]')
     SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5 -o PreferredAuthentications=password -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
     SSH="sshpass -p live ssh $SSH_OPTS liveuser@127.0.0.1 -p {{plain-qemu-ssh-port}}"
@@ -1021,13 +1045,9 @@ plain-enospc-gate target:
     fi
     RECIPE_TMP=$(mktemp /tmp/plain-enospc-recipe-XXXXXX.json)
     trap "rm -f '${RECIPE_TMP}'" EXIT
-    LIVE_TARGET=$(cat "{{target}}/live_target" 2>/dev/null | tr -d '[:space:]' || echo "{{target}}")
-    BOOTLOADER_VARIANT=$(echo "$LIVE_TARGET" | sed 's/-nvidia-open$//;s/-nvidia$//')
-    COMPOSEFS_BACKEND=$(cat "live/src/${BOOTLOADER_VARIANT}/composefs" 2>/dev/null | tr -d '[:space:]' || echo "true")
-    BOOTLOADER=$(cat "live/src/${BOOTLOADER_VARIANT}/bootloader" 2>/dev/null | tr -d '[:space:]' || echo "systemd")
-    if [[ "${BOOTLOADER}" == "grub" ]]; then BOOTLOADER="grub2"; fi
+    BOOTLOADER=$(variant_bootloader_recipe "{{target}}")
     printf '{\n  "disk": "/dev/vda",\n  "filesystem": "btrfs",\n  "image": "%s",\n  "composeFsBackend": %s,\n  "bootloader": "%s",\n  "hostname": "dakota-enospc-test",\n  "encryption": {"type": "none"},\n  "flatpaks": []\n}\n' \
-        "${INSTALL_IMAGE}" "$([ "${COMPOSEFS_BACKEND}" == "true" ] && echo "true" || echo "false")" "${BOOTLOADER}" > "${RECIPE_TMP}"
+        "${INSTALL_IMAGE}" "$(variant_composefs_json "{{target}}")" "${BOOTLOADER}" > "${RECIPE_TMP}"
     $SCP "${RECIPE_TMP}" liveuser@127.0.0.1:/tmp/enospc-recipe.json
     echo "Running fisherman (watching for OCI export completion)..."
     # Run fisherman via process substitution (not a pipe) so that exit 0/1
@@ -1076,6 +1096,85 @@ plain-test-qemu target:
          plain-qemu-monitor-live={{plain-qemu-monitor-live}} \
          plain-qemu-disk={{plain-qemu-disk}} \
          plain-install-qemu {{target}}
+    just output_dir={{output_dir}} qemu-mem={{qemu-mem}} plain-qemu-disk={{plain-qemu-disk}} \
+         plain-qemu-monitor-installed={{plain-qemu-monitor-installed}} \
+         plain-qemu-serial-installed={{plain-qemu-serial-installed}} \
+         plain-boot-qemu-installed {{target}}
+    just output_dir={{output_dir}} plain-qemu-monitor-installed={{plain-qemu-monitor-installed}} \
+         plain-qemu-serial-installed={{plain-qemu-serial-installed}} \
+         plain-verify-qemu {{target}}
+
+# Drive the already auto-launched graphical installer in a fresh debug ISO.
+# Expects output/<target>-debug-live.iso; unlike plain-e2e, this does not build it.
+gui-e2e target:
+    #!/usr/bin/bash
+    set -euo pipefail
+    DRIVER_LOG="{{plain-qemu-serial-live}}.atspi.log"
+    INSTALLER_LOG="{{output_dir}}/{{target}}-gui-installer-logs.txt"
+    [[ -f "{{output_dir}}/{{target}}-debug-live.iso" ]] || {
+        echo "No debug ISO found — run: just debug=1 iso-sd-boot {{target}}" >&2
+        exit 1
+    }
+    rm -f "{{plain-qemu-disk}}" "{{plain-scratch-disk}}" \
+           "{{plain-qemu-monitor-live}}" "{{plain-qemu-monitor-installed}}" \
+           "{{plain-qemu-serial-live}}" "{{plain-qemu-serial-installed}}" \
+           "${DRIVER_LOG}" "${INSTALLER_LOG}"
+    just output_dir={{output_dir}} qemu-mem={{qemu-mem}} plain-qemu-disk={{plain-qemu-disk}} \
+         plain-qemu-monitor-live={{plain-qemu-monitor-live}} \
+         plain-qemu-serial-live={{plain-qemu-serial-live}} \
+         plain-qemu-ssh-port={{plain-qemu-ssh-port}} \
+         plain-boot-qemu-live {{target}}
+    SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5 -o PreferredAuthentications=password"
+    SSH="sshpass -p live ssh $SSH_OPTS liveuser@127.0.0.1 -p {{plain-qemu-ssh-port}}"
+    SCP="sshpass -p live scp $SSH_OPTS -P {{plain-qemu-ssh-port}}"
+    echo "Mounting scratch disk (/dev/vdb) over /var/tmp..."
+    $SSH 'sudo bash -c "
+        mkfs.ext4 -F /dev/vdb >/dev/null
+        umount /var/tmp 2>/dev/null || true
+        mount /dev/vdb /var/tmp
+        echo \"/var/tmp is now disk-backed on /dev/vdb\"
+    "'
+    $SCP scripts/atspi-installer-driver.py liveuser@127.0.0.1:/home/liveuser/atspi-installer-driver.py
+    $SSH 'XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus python3 /home/liveuser/atspi-installer-driver.py --check-dependencies'
+    set +e
+    $SSH 'XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus python3 /home/liveuser/atspi-installer-driver.py --disk /dev/vda --timeout 2700' 2>&1 | tee "${DRIVER_LOG}"
+    DRIVER_STATUS="${PIPESTATUS[0]}"
+    set -e
+    {
+        echo "=== /var/log/bootc-installer.log ==="
+        $SSH 'sudo cat /var/log/bootc-installer.log' 2>&1 || true
+        echo "=== fisherman output ==="
+        $SSH 'cat /home/liveuser/.cache/bootc-installer/fisherman-output.log' 2>&1 || true
+    } > "${INSTALLER_LOG}"
+    if [[ "${DRIVER_STATUS}" -ne 0 ]]; then
+        exit "${DRIVER_STATUS}"
+    fi
+    echo "Patching BLS entries to add serial console..."
+    $SSH 'sudo bash -s' <<'REMOTE'
+    set -euo pipefail
+    boot_part="/dev/vda1"
+    if ls /dev/vda3 >/dev/null 2>&1; then
+    boot_part="/dev/vda2"
+    fi
+    mount_dir=$(mktemp -d)
+    trap 'umount "$mount_dir" 2>/dev/null || true; rmdir "$mount_dir"' EXIT
+    mount "$boot_part" "$mount_dir"
+    count=0
+    for entry in "$mount_dir"/loader/entries/*.conf "$mount_dir"/EFI/loader/entries/*.conf; do
+    [[ -f "$entry" ]] || continue
+    if grep -q '^options ' "$entry" && ! grep -q 'console=tty0' "$entry"; then
+    sed -i 's|^options .*|& console=tty0 console=ttyS0 rd.info systemd.journald.forward_to_console=yes|' "$entry"
+    count=$((count + 1))
+    echo "patched: $(basename "$entry")"
+    fi
+    done
+    echo "BLS patch: ${count} entries updated"
+    REMOTE
+    SOCAT_PREFIX=""
+    if ! test -w "{{plain-qemu-monitor-live}}" 2>/dev/null; then SOCAT_PREFIX="sudo"; fi
+    echo "system_powerdown" | $SOCAT_PREFIX socat - "UNIX-CONNECT:{{plain-qemu-monitor-live}}" 2>/dev/null || true
+    sleep 5
+    echo "quit" | $SOCAT_PREFIX socat - "UNIX-CONNECT:{{plain-qemu-monitor-live}}" 2>/dev/null || true
     just output_dir={{output_dir}} qemu-mem={{qemu-mem}} plain-qemu-disk={{plain-qemu-disk}} \
          plain-qemu-monitor-installed={{plain-qemu-monitor-installed}} \
          plain-qemu-serial-installed={{plain-qemu-serial-installed}} \
@@ -1274,7 +1373,7 @@ plain-verify-qemu target:
             SOCAT_PREFIX=""
             if ! test -w "$MONITOR" 2>/dev/null; then SOCAT_PREFIX="sudo"; fi
             echo "screendump $SCREENSHOT" | $SOCAT_PREFIX socat - "UNIX-CONNECT:$MONITOR" 2>/dev/null || true
-            bash "dakota/src/show-screenshot.sh" "$SCREENSHOT" "Installed system" 2>/dev/null || true
+            bash "live/src/show-screenshot.sh" "$SCREENSHOT" "Installed system" 2>/dev/null || true
             # Post-boot assertions (projectbluefin/dakota#651): UEFI entry +
             # Flatpak exclusion, over SSH into the now-booted installed system.
             POST_BOOT_RC=0
