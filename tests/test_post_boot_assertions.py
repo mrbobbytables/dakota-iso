@@ -89,14 +89,12 @@ class TestVerifyPostInstallScript(unittest.TestCase):
                 f"expected LUKS cmdline regex to NOT match: {cmdline!r}",
             )
 
-    def test_flatpak_assertion_treats_empty_output_as_pass(self):
-        """flatpak list | grep org.bootcinstaller producing no output must be
-        treated as a PASS (installer flatpak correctly excluded)."""
+    def test_flatpak_assertion_fails_on_command_error_or_leak(self):
+        """flatpak list failing must not pass vacuously, and presence of
+        org.bootcinstaller must fail."""
         text = VERIFY_SCRIPT.read_text()
-        self.assertIn(
-            'if [[ -z "$FLATPAK_OUT" ]]', text,
-            "flatpak exclusion check must treat empty grep output as success",
-        )
+        self.assertIn('FLATPAK_RC', text, "flatpak exclusion check must track exit code")
+        self.assertIn('org.bootcinstaller', text)
 
     def test_efibootmgr_assertion_requires_both_bootcurrent_and_boot_entry(self):
         text = VERIFY_SCRIPT.read_text()

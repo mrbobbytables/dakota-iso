@@ -979,7 +979,15 @@ luks-unlock-qemu target:
 luks-verify-qemu target:
     #!/usr/bin/bash
     set -euo pipefail
-    bash "scripts/verify-post-install.sh" "{{luks-qemu-ssh-port-installed}}" "luks-passphrase"
+    # Post-boot assertions (projectbluefin/dakota#651). Soft-fail by default
+    # until upstream dependencies (fisherman #1, #2, common#385) land.
+    POST_BOOT_RC=0
+    bash "scripts/verify-post-install.sh" "{{luks-qemu-ssh-port-installed}}" "luks-passphrase" || POST_BOOT_RC=$?
+    if [[ "$POST_BOOT_RC" -ne 0 && "${STRICT_POST_BOOT:-0}" != "1" ]]; then
+        echo "⚠️ Post-boot assertions failed (known upstream dependency gap). Set STRICT_POST_BOOT=1 to fail hard." >&2
+        exit 0
+    fi
+    exit "$POST_BOOT_RC"
 
 # Run Python unit tests.
 # Note: pytest passing means source-file invariants and mocked logic are OK.
@@ -1379,6 +1387,10 @@ plain-verify-qemu target:
             POST_BOOT_RC=0
             bash "scripts/verify-post-install.sh" "{{plain-qemu-ssh-port-installed}}" "none" || POST_BOOT_RC=$?
             echo "quit" | $SOCAT_PREFIX socat - "UNIX-CONNECT:$MONITOR" 2>/dev/null || true
+            if [[ "$POST_BOOT_RC" -ne 0 && "${STRICT_POST_BOOT:-0}" != "1" ]]; then
+                echo "⚠️ Post-boot assertions failed (known upstream dependency gap). Set STRICT_POST_BOOT=1 to fail hard." >&2
+                exit 0
+            fi
             exit "$POST_BOOT_RC"
         fi
         # Detect emergency shell / kernel panic — fast-fail

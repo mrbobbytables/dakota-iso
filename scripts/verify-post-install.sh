@@ -55,20 +55,27 @@ TOTAL=2
 echo "=== Assertion 1/${TOTAL}: UEFI boot entry (fisherman #2) ==="
 EFIBOOTMGR_OUT=$($SSH 'efibootmgr -v' 2>&1) || true
 echo "$EFIBOOTMGR_OUT"
-if echo "$EFIBOOTMGR_OUT" | grep -q "BootCurrent" && echo "$EFIBOOTMGR_OUT" | grep -qE "^Boot[0-9A-Fa-f]{4}"; then
-    echo "✅ UEFI boot entry present (BootCurrent + Boot#### entries found)"
+if echo "$EFIBOOTMGR_OUT" | grep -q "BootCurrent" && echo "$EFIBOOTMGR_OUT" | grep -qE "^Boot[0-9A-Fa-f]{4}.*(Dakota|Bluefin|Linux Boot Manager|systemd-boot|shimx64\.efi|systemd-bootx64\.efi)"; then
+    echo "✅ UEFI boot entry present (matching installed system loader found)"
+elif echo "$EFIBOOTMGR_OUT" | grep -q "BootCurrent" && echo "$EFIBOOTMGR_OUT" | grep -qE "^Boot[0-9A-Fa-f]{4}"; then
+    echo "⚠️ BootCurrent found but specific installer entry label/path missing"
+    FAIL=1
 else
     echo "❌ No UEFI boot entry found — expected 'BootCurrent' and 'Boot####' lines from efibootmgr -v"
     FAIL=1
 fi
 
 echo "=== Assertion 2/${TOTAL}: installer Flatpak excluded (fisherman #1) ==="
-FLATPAK_OUT=$($SSH 'flatpak list --system --app 2>/dev/null | grep org.bootcinstaller' 2>&1) || true
-if [[ -z "$FLATPAK_OUT" ]]; then
-    echo "✅ Installer Flatpak (org.bootcinstaller) not present on installed system"
-else
-    echo "❌ Installer Flatpak leaked onto installed system: $FLATPAK_OUT"
+FLATPAK_RC=0
+FLATPAK_OUT=$($SSH 'flatpak list --system --app 2>&1') || FLATPAK_RC=$?
+if [[ "$FLATPAK_RC" -ne 0 ]]; then
+    echo "❌ flatpak list command failed with code ${FLATPAK_RC}: ${FLATPAK_OUT}"
     FAIL=1
+elif echo "$FLATPAK_OUT" | grep -q 'org.bootcinstaller'; then
+    echo "❌ Installer Flatpak leaked onto installed system: $(echo "$FLATPAK_OUT" | grep 'org.bootcinstaller')"
+    FAIL=1
+else
+    echo "✅ Installer Flatpak (org.bootcinstaller) not present on installed system"
 fi
 
 if [[ "$ENCRYPTION_TYPE" == "luks-passphrase" ]]; then
